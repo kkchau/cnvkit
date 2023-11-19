@@ -3,4 +3,10 @@
 
 from setuptools import setup
 
-setup()
+setup(
+    extras_require={
+        "hmm": [
+            "pomegranate==1.0.0",
+        ]
+    }
+)

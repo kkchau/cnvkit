@@ -1,3 +1,6 @@
+# TEMP DEV
+env/
+
 # Compiled python files (e.g. from running the unit tests):
 *.pyc
 *.pyo

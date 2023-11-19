@@ -1,18 +1,37 @@
 """Segmentation by Hidden Markov Model."""
 import collections
 import logging
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import pandas as pd
-import pomegranate as pom
 import scipy.special
 
+from cnvlib.descriptives import biweight_midvariance
+from skgenome.gary import GenomicArray
+
 from ..cnary import CopyNumArray as CNA
-from ..descriptives import biweight_midvariance
 from ..segfilters import squash_by_groups
 
+if TYPE_CHECKING:
+    from pomegranate.distributions import Normal
+    from pomegranate.hmm import DenseHMM
+else:
+    Normal = object
+    DenseHMM = object
 
-def segment_hmm(cnarr, method, diploid_parx_genome, window=None, variants=None, processes=1):
+logger = logging.getLogger(__name__)
+
+DISTRIBUTION_INERTIA = 0.8  # Allow updating distributions, but slowly
+EDGE_INERTIA = 0.1
+
+
+def segment_hmm(
+    cnarr: CNA,
+    method: str,
+    diploid_parx_genome: Optional[str] = None,
+    window: Optional[float] = None,
+) -> GenomicArray:
     """Segment bins by Hidden Markov Model.
 
     Use Viterbi method to infer copy number segments from sequential data.
@@ -27,6 +46,8 @@ def segment_hmm(cnarr, method, diploid_parx_genome, window=None, variants=None, 
     method : string
         One of 'hmm' (3 states, flexible means), 'hmm-tumor' (5 states, flexible
         means), 'hmm-germline' (3 states, fixed means).
+    diploid_parx_genome : string
+        Whether to include PAR1/2 from chr X within the autosomes.
 
     Results
     -------
@@ -38,35 +59,38 @@ def segment_hmm(cnarr, method, diploid_parx_genome, window=None, variants=None, 
     orig_log2 = cnarr["log2"].values.copy()
     cnarr["log2"] = cnarr.smooth_log2(window)
 
-    logging.info("Building model from observations")
-    model = hmm_get_model(cnarr, method, diploid_parx_genome, processes)
+    logger.info("Building model from observations")
+    model = hmm_get_model(cnarr, method, diploid_parx_genome)
 
-    logging.info("Predicting states from model")
-    observations = as_observation_matrix(cnarr)
-    states = np.concatenate(
-        [np.array(model.predict(obs, algorithm="map")) for obs in observations]
+    logger.info("Predicting states from model")
+    observations = np.array(
+        [[[x] for x in np.concatenate(as_observation_matrix(cnarr))]]
     )
+    states = model.predict(observations)
 
-    logging.info("Done, now finalizing")
-    logging.debug("Model states: %s", model.states)
-    logging.debug("Predicted states: %s", states[:100])
-    logging.debug(str(collections.Counter(states)))
-    logging.debug("Observations: %s", observations[0][:100])
-    logging.debug("Edges: %s", model.edges)
+    logger.info("Done, now finalizing")
+    logger.debug("Predicted states: %s", states)
+    logger.debug(str(collections.Counter([state.item() for state in states[0]])))
+    logger.debug(
+        "Observations: %s", [observation[0] for observation in observations[0][:100]]
+    )
+    logger.debug("Edges: %s", model.edges)
 
     # Merge adjacent bins with the same state to create segments
     cnarr["log2"] = orig_log2
     cnarr["probes"] = 1
     segarr = squash_by_groups(
-        cnarr, pd.Series(states, index=cnarr.data.index), by_arm=True
+        cnarr, pd.Series(states[0], index=cnarr.data.index), by_arm=True
     )
     if not (segarr.start < segarr.end).all():
         bad_segs = segarr[segarr.start >= segarr.end]
-        logging.warning("Bad segments:\n%s", bad_segs.data)
+        logger.warning("Bad segments:\n%s", bad_segs.data)
     return segarr
 
 
-def hmm_get_model(cnarr, method, diploid_parx_genome, processes):
+def hmm_get_model(
+    cnarr: CNA, method: str, diploid_parx_genome: Optional[str] = None
+) -> DenseHMM:
     """
 
     Parameters
@@ -74,44 +98,53 @@ def hmm_get_model(cnarr, method, diploid_parx_genome, processes):
     cnarr : CopyNumArray
         The normalized bin-level values to be segmented.
     method : string
-        One of 'hmm', 'hmm-tumor', 'hmm-germline'.
+        One of 'hmm' (3 states, flexible means), 'hmm-tumor' (5 states, flexible
+        means), 'hmm-germline' (3 states, fixed means).
     diploid_parx_genome : string
         Whether to include PAR1/2 from chr X within the autosomes.
-    processes : int
-        Number of parallel jobs to run.
 
     Returns
     -------
     model :
         A pomegranate HiddenMarkovModel trained on the given dataset.
     """
-    assert method in ("hmm-tumor", "hmm-germline", "hmm")
-    observations = as_observation_matrix(cnarr.autosomes(diploid_parx_genome=diploid_parx_genome))
+    try:
+        from pomegranate.hmm import DenseHMM
+    except ImportError:
+        logger.exception(
+            "Calling with hmm requires pomegranate. Reinstall with hmm support via `cnvkit[hmm]`."
+        )
+        raise
+    assert (
+        method in ("hmm-tumor", "hmm-germline", "hmm")
+    ), f"Invalid method {method} specified. Expected one of 'hmm-tumor', 'hmm-germline', or 'hmm'."
+    observations = np.concatenate(
+        as_observation_matrix(cnarr.autosomes(diploid_parx_genome=diploid_parx_genome))
+    )
+    variance = biweight_midvariance(observations) ** 2
 
-    # Estimate standard deviation from the full distribution, robustly
-    stdev = biweight_midvariance(np.concatenate(observations), initial=0)
     if method == "hmm-germline":
         state_names = ["loss", "neutral", "gain"]
         distributions = [
-            pom.NormalDistribution(-1.0, stdev, frozen=True),
-            pom.NormalDistribution(0.0, stdev, frozen=True),
-            pom.NormalDistribution(0.585, stdev, frozen=True),
+            normal_distribution(mean=-1.0, variance=variance, frozen=True),
+            normal_distribution(mean=0.0, variance=variance, frozen=True),
+            normal_distribution(mean=0.585, variance=variance, frozen=True),
         ]
     elif method == "hmm-tumor":
         state_names = ["del", "loss", "neutral", "gain", "amp"]
         distributions = [
-            pom.NormalDistribution(-2.0, stdev, frozen=False),
-            pom.NormalDistribution(-0.5, stdev, frozen=False),
-            pom.NormalDistribution(0.0, stdev, frozen=True),
-            pom.NormalDistribution(0.3, stdev, frozen=False),
-            pom.NormalDistribution(1.0, stdev, frozen=False),
+            normal_distribution(mean=-2.0, variance=variance, frozen=False),
+            normal_distribution(mean=-0.5, variance=variance, frozen=False),
+            normal_distribution(mean=0.0, variance=variance, frozen=True),
+            normal_distribution(mean=0.3, variance=variance, frozen=False),
+            normal_distribution(mean=1.0, variance=variance, frozen=False),
         ]
     else:
         state_names = ["loss", "neutral", "gain"]
         distributions = [
-            pom.NormalDistribution(-1.0, stdev, frozen=False),
-            pom.NormalDistribution(0.0, stdev, frozen=False),
-            pom.NormalDistribution(0.585, stdev, frozen=False),
+            normal_distribution(mean=-1.0, variance=variance, frozen=False),
+            normal_distribution(mean=0.0, variance=variance, frozen=False),
+            normal_distribution(mean=0.585, variance=variance, frozen=False),
         ]
 
     n_states = len(distributions)
@@ -122,29 +155,21 @@ def hmm_get_model(cnarr, method, diploid_parx_genome, processes):
     # Prefer to keep the current state in each transition
     # All other transitions are equally likely, to start
     transition_matrix = (
-        np.identity(n_states) * 100 + np.ones((n_states, n_states)) / n_states
-    )
+        (np.identity(n_states, dtype=np.float32) * 100)
+        + (np.ones((n_states, n_states), dtype=np.float32) / n_states)
+    ) / (100 + (1 / n_states))
 
-    model = pom.HiddenMarkovModel.from_matrix(
-        transition_matrix,
-        distributions,
-        start_probabilities,
-        state_names=state_names,
-        name=method,
+    model = DenseHMM(
+        distributions=distributions,
+        edges=transition_matrix,
+        starts=start_probabilities,
+        inertia=0.1,
     )
+    X = np.array([[[x] for x in observations]])
 
-    model.fit(
-        sequences=observations,
-        weights=[len(obs) for obs in observations],
-        distribution_inertia=0.8,  # Allow updating dists, but slowly
-        edge_inertia=0.1,
-        # lr_decay=.75,
-        pseudocount=5,
-        use_pseudocount=True,
-        max_iterations=100000,
-        n_jobs=processes,
-        verbose=False,
-    )
+    # Fit the model to the observations
+    model.fit(X=X)
+
     return model
 
 
@@ -165,13 +190,38 @@ def as_observation_matrix(cnarr, variants=None):
     return observations
 
 
+def normal_distribution(mean: float, variance: float, frozen: bool) -> Normal:
+    try:
+        from pomegranate.distributions import Normal
+    except ImportError:
+        logger.exception(
+            "Calling with hmm requires pomegranate. Reinstall with hmm support via `cnvkit[hmm]`."
+        )
+        raise
+    else:
+        return Normal(
+            means=[mean],
+            covs=[[np.float32(variance)]],
+            covariance_type="full",
+            inertia=DISTRIBUTION_INERTIA,
+            frozen=frozen,
+        )
+
+
 def variants_in_segment(varr, segment, min_variants=50):
+    try:
+        from pomegranate.hmm import DenseHMM
+    except ImportError:
+        logger.exception(
+            "Calling with hmm requires pomegranate. Reinstall with hmm support via `cnvkit[hmm]`."
+        )
+        raise
     if len(varr) > min_variants:
         observations = varr.mirrored_baf(above_half=True)
         state_names = ["neutral", "alt"]
         distributions = [
-            pom.NormalDistribution(0.5, 0.1, frozen=True),
-            pom.NormalDistribution(0.67, 0.1, frozen=True),
+            normal_distribution(0.5, 0.1, frozen=True),
+            normal_distribution(0.67, 0.1, frozen=True),
         ]
         n_states = len(distributions)
         # Starts -- prefer neutral
@@ -179,34 +229,29 @@ def variants_in_segment(varr, segment, min_variants=50):
         # Prefer to keep the current state in each transition
         # All other transitions are equally likely, to start
         transition_matrix = (
-            np.identity(n_states) * 100 + np.ones((n_states, n_states)) / n_states
-        )
-        model = pom.HiddenMarkovModel.from_matrix(
-            transition_matrix,
-            distributions,
-            start_probabilities,
-            state_names=state_names,
-            name="loh",
+            (np.identity(n_states, dtype=np.float32) * 100)
+            + (np.ones((n_states, n_states), dtype=np.float32) / n_states)
+        ) / (100 + (1 / n_states))
+
+        model = DenseHMM(
+            distributions=distributions,
+            edges=transition_matrix,
+            starts=start_probabilities,
+            inertia=0.1,
         )
 
-        model.fit(
-            sequences=[observations],
-            edge_inertia=0.1,
-            lr_decay=0.75,
-            pseudocount=5,
-            use_pseudocount=True,
-            max_iterations=100000,
-            # n_jobs=1,  # processes,
-            verbose=False,
-        )
-        states = np.array(model.predict(observations, algorithm="map"))
+        X = np.array([[[x] for x in observations]])
+        model.fit(X=X)
+        states = np.array(model.predict(X))
 
-        logging.info("Done, now finalizing")
-        logging.debug("Model states: %s", model.states)
-        logging.debug("Predicted states: %s", states[:100])
-        logging.debug(str(collections.Counter(states)))
-        # logging.debug("Observations: %s", observations[0][:100])
-        logging.debug("Edges: %s", model.edges)
+        logger.info("Done, now finalizing")
+        logger.debug("Predicted states: %s", states)
+        logger.debug(str(collections.Counter([state.item() for state in states[0]])))
+        logger.debug(
+            "Observations: %s",
+            [observation[0] for observation in observations[0][:100]],
+        )
+        logger.debug("Edges: %s", model.edges)
 
         # Merge adjacent bins with the same state to create segments
         fake_cnarr = CNA(varr.add_columns(weight=1, log2=0, gene=".").data)
@@ -217,7 +262,7 @@ def variants_in_segment(varr, segment, min_variants=50):
         results = None
 
     if results is not None and len(results) > 1:
-        logging.info(
+        logger.info(
             "Segment %s:%d-%d on allele freqs for %d additional breakpoints",
             segment.chromosome,
             segment.start,
